@@ -1123,7 +1123,7 @@ fn profile_arguments(arguments: &[OsString]) -> Vec<OsString> {
     RustcInvocation::expand_arguments(arguments).unwrap_or_else(|_| arguments.to_vec())
 }
 
-/// `wrapper_argument` is set only when `rustc` is clippy-driver, which is
+/// `wrapper_argument` is set only when `rustc` is a lint driver, which is
 /// handed the real rustc and compiles in its own process.
 fn compiler_demand(
     name: &str,
@@ -2798,6 +2798,9 @@ fn base_action_context(
             path,
         });
     }
+    if Path::new(rustc).file_stem() == Some(OsStr::new("dylint-driver")) {
+        add_dylint_inputs(&mut context, working_dir)?;
+    }
     Ok(context)
 }
 
@@ -2822,6 +2825,70 @@ fn compiler_environment(
         .into_iter()
         .filter_map(|name| lookup(name).map(|value| (name.into(), Some(value))))
         .collect()
+}
+
+/// Variables dylint-driver reads to decide which lint libraries to load and
+/// how to configure them. The driver folds them into an untracked-state
+/// `--env-set` of its own, which mbx never sees, so they key the action here.
+const DYLINT_ENVIRONMENT: [&str; 7] = [
+    "CLIPPY_DISABLE_DOCS_LINKS",
+    "DYLINT_LIBS",
+    "DYLINT_METADATA",
+    "DYLINT_NO_DEPS",
+    "DYLINT_RUSTFLAGS",
+    "DYLINT_TOML",
+    "RUSTUP_TOOLCHAIN",
+];
+
+/// Key a dylint-driver compilation on the lint libraries it loads, by
+/// content, on its configuration variables, and on any `dylint.toml` the
+/// libraries could read.
+fn add_dylint_inputs(context: &mut ActionContext, working_dir: &Path) -> Result<()> {
+    for name in DYLINT_ENVIRONMENT {
+        if let Ok(value) = std::env::var(name) {
+            context.environment.insert(name.into(), Some(value));
+        }
+    }
+    let libraries = std::env::var("DYLINT_LIBS").unwrap_or_default();
+    let libraries: Vec<PathBuf> = if libraries.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&libraries).wrap_err("failed to parse DYLINT_LIBS")?
+    };
+    for path in libraries {
+        context.inputs.push(ActionInput {
+            digest: CacheDigest::blake3_file(&path)
+                .wrap_err_with(|| format!("failed to hash dylint library {}", path.display()))?,
+            path,
+        });
+    }
+    if let Some(path) = selected_dylint_config(working_dir) {
+        context.inputs.push(ActionInput {
+            digest: CacheDigest::blake3_file(&path)?,
+            path,
+        });
+    }
+    Ok(())
+}
+
+/// The `dylint.toml` dylint libraries would read: the one `DYLINT_TOML` does
+/// not replace, at the nearest enclosing directory of the package.
+fn selected_dylint_config(working_dir: &Path) -> Option<PathBuf> {
+    if std::env::var_os("DYLINT_TOML").is_some() {
+        return None;
+    }
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| working_dir.to_path_buf(), PathBuf::from);
+    let mut directory = std::fs::canonicalize(start).ok()?;
+    loop {
+        let path = directory.join("dylint.toml");
+        if path.is_file() {
+            return Some(path);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
 }
 
 /// Find the config Clippy would load before consulting stale dep-info.
@@ -3575,7 +3642,12 @@ fn compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
 
 fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
     let executable = resolve_executable(rustc)?;
-    let clippy = Path::new(rustc).file_stem() == Some(OsStr::new("clippy-driver"));
+    let driver = Path::new(rustc).file_stem().and_then(OsStr::to_str);
+    let driver_version_flag = match driver {
+        Some("clippy-driver") => Some("--version"),
+        Some("dylint-driver") => Some("-V"),
+        _ => None,
+    };
     let environment = ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"]
         .into_iter()
         .map(|name| (name.into(), std::env::var(name).ok()))
@@ -3619,9 +3691,9 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         let remap = probe_remap_cwd(&executable, &release);
         stdout.extend_from_slice(format!("\nmbx-remap-cwd-dot-v1: {remap}\n").as_bytes());
         let host = identity_field(&String::from_utf8_lossy(&stdout), "host")?.to_string();
-        if clippy {
+        if let Some(flag) = driver_version_flag {
             let mut command = Command::new(&executable);
-            command.arg("--version");
+            command.arg(flag);
             for (name, value) in &environment {
                 if let Some(value) = value {
                     command.env(name, value);
@@ -3630,10 +3702,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
                 }
             }
             let output = crate::phase_timing::measure("compiler", || command.output())
-                .wrap_err("failed to query the clippy-driver identity")?;
+                .wrap_err("failed to query the lint driver identity")?;
             if !output.status.success() {
                 bail!(
-                    "clippy-driver identity command failed: {}",
+                    "lint driver identity command failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }

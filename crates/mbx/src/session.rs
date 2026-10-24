@@ -593,7 +593,7 @@ impl CacheSession {
             // that path to recognize the nested invocation. Clippy has a
             // modeled identity and configuration inputs; other workspace
             // wrappers remain transparent because mbx cannot key their work.
-            if executable_stem(OsStr::new(previous)) != Some("clippy-driver") {
+            if !is_lint_driver(OsStr::new(previous)) {
                 warn!(
                     "RUSTC_WORKSPACE_WRAPPER is already set to {previous}; deferring to it for workspace crates, so those compilations are not cached"
                 );
@@ -1839,10 +1839,9 @@ fn workspace_wrapper_arguments<'a>(
     compiler: &OsStr,
     arguments: &'a [OsString],
 ) -> (Option<&'a OsStr>, &'a [OsString]) {
-    let wrapper_argument = arguments.first().filter(|argument| {
-        executable_stem(compiler) == Some("clippy-driver")
-            && executable_stem(argument) == Some("rustc")
-    });
+    let wrapper_argument = arguments
+        .first()
+        .filter(|argument| is_lint_driver(compiler) && executable_stem(argument) == Some("rustc"));
     match wrapper_argument {
         Some(argument) => (Some(argument.as_os_str()), &arguments[1..]),
         None => (None, arguments),
@@ -1868,12 +1867,18 @@ fn compiler_runs_through_wrapper_using(
     get: impl Fn(&str) -> Option<OsString>,
 ) -> bool {
     get(PREVIOUS_RUSTC_WRAPPER_ENV).is_some()
-        || (!is_clippy_driver(compiler)
+        || (!is_lint_driver(compiler)
             && get(PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV).is_some_and(|wrapper| wrapper == compiler))
 }
 
-pub(crate) fn is_clippy_driver(compiler: &OsStr) -> bool {
-    executable_stem(compiler) == Some("clippy-driver")
+/// Drivers that take the real rustc as their first argument and compile in
+/// their own process with extra lints loaded: clippy-driver under
+/// `cargo clippy`, and dylint-driver under `cargo dylint`.
+pub(crate) fn is_lint_driver(compiler: &OsStr) -> bool {
+    matches!(
+        executable_stem(compiler),
+        Some("clippy-driver" | "dylint-driver")
+    )
 }
 
 fn transparent_compiler_demand(
@@ -1925,7 +1930,7 @@ fn run_transparent_rustc(
             described,
             incremental_flag.as_deref(),
             compiler_runs_through_wrapper(&rustc),
-            is_clippy_driver(&rustc),
+            is_lint_driver(&rustc),
         )
     });
     let permit = demand
