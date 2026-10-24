@@ -313,6 +313,7 @@ pub(crate) fn compile(
         reuse_hot_workspace_plan(&compilation, &outputs, learned_enabled)
     };
     let mut unshareable = false;
+    let mut dep_info_missed = false;
     if !private_inputs
         && !learned.engaged()
         && outputs.dep_info.is_file()
@@ -367,6 +368,7 @@ pub(crate) fn compile(
                 }
             }
             Ok(None) => {
+                dep_info_missed = true;
                 // The fast plan already measured this unit for this compile.
                 if !learned.backstop_rejected {
                     learned = plan_learned_reuse(&compilation, &discovered, learned_enabled);
@@ -383,7 +385,7 @@ pub(crate) fn compile(
         learned = plan_learned_without_action_key(&compilation, &outputs);
     }
     let mut prediction_missing = private_inputs;
-    if !private_inputs && !learned.engaged() && !action_lookup_attempted {
+    if !private_inputs && !learned.engaged() && (!action_lookup_attempted || dep_info_missed) {
         match restore_predicted_result(
             &compilation,
             &outputs,
